@@ -58,6 +58,67 @@ class Build:
         log_tail_lines=100,
         sticky_builds=False,
     ):
+        """
+        Parameters
+        ----------
+
+        q : tornado.queues.Queue
+            Queue that receives progress events after the build has been submitted
+        api : kubernetes.client.CoreV1Api()
+            Api object to make kubernetes requests via
+        name : str
+            A unique name for the thing (repo, ref) being built. Used to coalesce
+            builds, make sure they are not being unnecessarily repeated
+        namespace : str
+            Kubernetes namespace to spawn build pods into
+        repo_url : str
+            URL of repository to build.
+            Passed through to repo2docker.
+        ref : str
+            Ref of repository to build
+            Passed through to repo2docker.
+        build_image : str
+            Docker image containing repo2docker that is used to spawn the build
+            pods.
+        docker_host : str
+            The docker socket to use for building the image.
+            Must be a unix domain socket on a filesystem path accessible on the
+            node in which the build pod is running.
+        image_name : str
+            Full name of the image to build. Includes the tag.
+            Passed through to repo2docker.
+        git_credentials : str
+            Git credentials to use to clone private repositories. Passed
+            through to repo2docker via the GIT_CREDENTIAL_ENV environment
+            variable. Can be anything that will be accepted by git as
+            a valid output from a git-credential helper. See
+            https://git-scm.com/docs/gitcredentials for more information.
+        push_secret : str
+            Kubernetes secret containing credentials to push docker image to registry.
+        memory_limit
+            Memory limit for the docker build process. Can be an integer in
+            bytes, or a byte specification (like 6M).
+            Passed through to repo2docker.
+        memory_request
+            Memory request of the build pod. The actual building happens in the
+            docker daemon, but setting request in the build pod makes sure that
+            memory is reserved for the docker build in the node by the kubernetes
+            scheduler.
+        node_selector : dict
+            Node selector for the kubernetes build pod.
+        appendix : str
+            Appendix to be added at the end of the Dockerfile used by repo2docker.
+            Passed through to repo2docker.
+        log_tail_lines : int
+            Number of log lines to fetch from a currently running build.
+            If a build with the same name is already running when submitted,
+            only the last `log_tail_lines` number of lines will be fetched and
+            displayed to the end user. If not, all log lines will be streamed.
+        sticky_builds : bool
+            If true, builds for the same repo (but different refs) will try to
+            schedule on the same node, to reuse cache layers in the docker daemon
+            being used.
+        """
         self.q = q
         self.api = api
         self.repo_url = repo_url
@@ -183,14 +244,16 @@ class Build:
         repository prefer to schedule on the same node in order to reuse the
         docker layer cache of previous builds.
         """
-        dind_pods = self.api.list_namespaced_pod(
+        resp = self.api.list_namespaced_pod(
             self.namespace,
             label_selector="component=dind,app=binder",
             _request_timeout=KUBE_REQUEST_TIMEOUT,
+            _preload_content=False,
         )
+        dind_pods = json.loads(resp.read())
 
         if self.sticky_builds and dind_pods:
-            node_names = [pod.spec.node_name for pod in dind_pods.items]
+            node_names = [pod["spec"]["nodeName"] for pod in dind_pods["items"]]
             ranked_nodes = rendezvous_rank(node_names, self.repo_url)
             best_node_name = ranked_nodes[0]
 
@@ -235,7 +298,12 @@ class Build:
         return affinity
 
     def submit(self):
-        """Submit a build pod to create the image for the repository."""
+        """
+        Submit a build pod to create the image for the repository.
+
+        Progress of the build can be monitored by listening for items in
+        the Queue passed to the constructor as `q`.
+        """
         volume_mounts = [
             client.V1VolumeMount(mount_path="/var/run/docker.sock", name="docker-socket")
         ]
@@ -246,9 +314,9 @@ class Build:
         )]
 
         if self.push_secret:
-            volume_mounts.append(client.V1VolumeMount(mount_path="/root/.docker", name='docker-push-secret'))
+            volume_mounts.append(client.V1VolumeMount(mount_path="/root/.docker", name='docker-config'))
             volumes.append(client.V1Volume(
-                name='docker-push-secret',
+                name='docker-config',
                 secret=client.V1SecretVolumeSource(secret_name=self.push_secret)
             ))
 
@@ -351,7 +419,9 @@ class Build:
                 return
 
     def stream_logs(self):
-        """Stream a pod's logs"""
+        """
+        Stream build logs to the queue in self.q
+        """
         app_log.info("Watching logs of %s", self.name)
         for line in self.api.read_namespaced_pod_log(
             self.name,
@@ -385,7 +455,9 @@ class Build:
             app_log.info("Finished streaming logs of %s", self.name)
 
     def cleanup(self):
-        """Delete a kubernetes pod."""
+        """
+        Delete the kubernetes build pod
+        """
         try:
             self.api.delete_namespaced_pod(
                 name=self.name,
@@ -401,7 +473,9 @@ class Build:
                 raise
 
     def stop(self):
-        """Stop watching a build"""
+        """
+        Stop wathcing for progress of build.
+        """
         self.stop_event.set()
 
 class FakeBuild(Build):

@@ -281,7 +281,7 @@ If you setup your own local registry using
           url: "https://index.docker.io/v1"
         config:
           DockerRegistry:
-            url: "https://registry.hub.docker.com" # the actual v2 registry url
+            url: "https://registry-1.docker.io" # the recommended registry URL
             auth_config_url: "https://index.docker.io/v1" # must match above!
             token_url: "https://auth.docker.io/token?service=registry.docker.io"
 
@@ -310,7 +310,7 @@ First, get the latest helm chart for BinderHub.::
 Next, **install the Helm Chart** using the configuration files
 that you've just created. Do this by running the following command::
 
-    helm install jupyterhub/binderhub --version=0.2.0-3b53fce  --name=<choose-name> --namespace=<choose-namespace> -f secret.yaml -f config.yaml
+    helm install <choose-name> jupyterhub/binderhub --version=0.2.0-3b53fce --namespace=<choose-namespace> -f secret.yaml -f config.yaml
 
 This command will install the Helm chart released on March 3rd, 2019 as
 identified by the commit hash (the random string after `0.2.0-`), which is

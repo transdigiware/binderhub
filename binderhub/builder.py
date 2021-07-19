@@ -2,15 +2,16 @@
 Handlers for working with version control services (i.e. GitHub) for builds.
 """
 
+import asyncio
 import hashlib
 from http.client import responses
 import json
 import string
+import re
 import time
 import escapism
 
 import docker
-from tornado.concurrent import chain_future, Future
 from tornado import gen
 from tornado.httpclient import HTTPClientError
 from tornado.web import Finish, authenticated
@@ -53,6 +54,30 @@ LAUNCH_COUNT = Counter(
 )
 BUILDS_INPROGRESS = Gauge('binderhub_inprogress_builds', 'Builds currently in progress')
 LAUNCHES_INPROGRESS = Gauge('binderhub_inprogress_launches', 'Launches currently in progress')
+
+
+def _get_image_basename_and_tag(full_name):
+    """Get a supposed image name and tag without the registry part
+    :param full_name: full image specification, e.g. "gitlab.com/user/project:tag"
+    :return: tuple of image name and tag, e.g. ("user/project", "tag")
+    """
+    # the tag is either after the last (and only) colon, or not given at all,
+    # in which case "latest" is implied
+    tag_splits = full_name.rsplit(':', 1)
+    if len(tag_splits) == 2:
+        image_name = tag_splits[0]
+        tag = tag_splits[1]
+    else:
+        image_name = full_name
+        tag = 'latest'
+
+    if re.fullmatch('[a-z0-9]{4,40}/[a-z0-9._-]{2,255}', image_name):
+        # if it looks like a Docker Hub image name, we're done
+        return image_name, tag
+    # if the image isn't implied to origin at Docker Hub,
+    # the first part has to be a registry
+    image_basename = '/'.join(image_name.split('/')[1:])
+    return image_basename, tag
 
 
 def _generate_build_name(build_slug, ref, prefix='', limit=63, ref_length=6):
@@ -214,6 +239,11 @@ class BuildHandler(BaseHandler):
         prefix = '/build/' + provider_prefix
         spec = self.get_spec_from_request(prefix)
 
+        # verify the build token and rate limit
+        build_token = self.get_argument("build_token", None)
+        self.check_build_token(build_token, f"{provider_prefix}/{spec}")
+        self.check_rate_limit()
+
         # Verify if the provider is valid for EventSource.
         # EventSource cannot handle HTTP errors, so we must validate and send
         # error messages on the eventsource.
@@ -310,7 +340,7 @@ class BuildHandler(BaseHandler):
         if self.settings['use_registry']:
             for _ in range(3):
                 try:
-                    image_manifest = await self.registry.get_image_manifest(*'/'.join(image_name.split('/')[-2:]).split(':', 1))
+                    image_manifest = await self.registry.get_image_manifest(*_get_image_basename_and_tag(image_name))
                     image_found = bool(image_manifest)
                     break
                 except HTTPClientError:
@@ -339,19 +369,26 @@ class BuildHandler(BaseHandler):
             })
             with LAUNCHES_INPROGRESS.track_inprogress():
                 await self.launch(kube, provider)
-            self.event_log.emit('binderhub.jupyter.org/launch', 4, {
-                'provider': provider.name,
-                'spec': spec,
-                'ref': ref,
-                'status': 'success',
-                'origin': self.settings['normalized_origin'] if self.settings['normalized_origin'] else self.request.host
-            })
+            self.event_log.emit(
+                "binderhub.jupyter.org/launch",
+                5,
+                {
+                    "provider": provider.name,
+                    "spec": spec,
+                    "ref": ref,
+                    "status": "success",
+                    "build_token": self._have_build_token,
+                    "origin": self.settings["normalized_origin"]
+                    if self.settings["normalized_origin"]
+                    else self.request.host,
+                },
+            )
             return
 
         # Prepare to build
         q = Queue()
 
-        if self.settings['use_registry']:
+        if self.settings['use_registry'] or self.settings['build_docker_config']:
             push_secret = self.settings['push_secret']
         else:
             push_secret = None
@@ -447,13 +484,20 @@ class BuildHandler(BaseHandler):
             BUILD_COUNT.labels(status='success', **self.repo_metric_labels).inc()
             with LAUNCHES_INPROGRESS.track_inprogress():
                 await self.launch(kube, provider)
-            self.event_log.emit('binderhub.jupyter.org/launch', 4, {
-                'provider': provider.name,
-                'spec': spec,
-                'ref': ref,
-                'status': 'success',
-                'origin': self.settings['normalized_origin'] if self.settings['normalized_origin'] else self.request.host
-            })
+            self.event_log.emit(
+                "binderhub.jupyter.org/launch",
+                5,
+                {
+                    "provider": provider.name,
+                    "spec": spec,
+                    "ref": ref,
+                    "status": "success",
+                    "build_token": self._have_build_token,
+                    "origin": self.settings["normalized_origin"]
+                    if self.settings["normalized_origin"]
+                    else self.request.host,
+                },
+            )
 
         # Don't close the eventstream immediately.
         # (javascript) eventstream clients reconnect automatically on dropped connections,
@@ -485,19 +529,16 @@ class BuildHandler(BaseHandler):
             self.settings["build_namespace"],
             label_selector='app=jupyterhub,component=singleuser-server',
             _request_timeout=KUBE_REQUEST_TIMEOUT,
+            _preload_content=False,
         )
-        # concurrent.futures.Future isn't awaitable
-        # wrap in tornado Future
-        # tornado 5 will have `.run_in_executor`
-        tf = Future()
-        chain_future(f, tf)
-        pods = await tf
-        for pod in pods.items:
+        resp = await asyncio.wrap_future(f)
+        pods = json.loads(resp.read())
+        for pod in pods["items"]:
             total_pods += 1
-            for container in pod.spec.containers:
+            for container in pod["spec"]["containers"]:
                 # is the container running the same image as us?
                 # if so, count one for the current repo.
-                image = container.image.rsplit(':', 1)[0]
+                image = container["image"].rsplit(":", 1)[0]
                 if image == image_no_tag:
                     matching_pods += 1
                     break
